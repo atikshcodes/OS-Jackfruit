@@ -2,9 +2,7 @@ obj-m += monitor.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-# If you want host-built workload binaries to run directly inside an Alpine
-# rootfs, you can override this with WORKLOAD_LDFLAGS=-static when your
-# toolchain supports it.
+
 WORKLOAD_LDFLAGS ?= -static
 
 USER_TARGETS := engine memory_hog cpu_hog io_pulse
@@ -32,7 +30,7 @@ monitor.ko: monitor.c monitor_ioctl.h
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	if [ -d "$(KDIR)" ]; then $(MAKE) -C $(KDIR) M=$(PWD) clean; fi
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f $(USER_TARGETS) *.o *.mod *.mod.c *.symvers *.order
 	rm -f *.log
 	rm -rf logs

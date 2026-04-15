@@ -1,50 +1,67 @@
 /*
- * cpu_hog.c - CPU-bound workload for scheduler experiments.
+ * memory_hog.c - Controlled memory pressure generator
  *
- * Usage:
- *   /cpu_hog [seconds]
- *
- * The program burns CPU and prints progress once per second so students
- * can compare completion times and responsiveness under different
- * priorities or CPU-affinity settings.
- *
- * If you copy this binary into an Alpine rootfs, make sure it is built in a
- * format that can run there.
+ * Improvements:
+ *  - deterministic growth (MB per step)
+ *  - guaranteed RSS increase (page touching)
+ *  - configurable delay (ms)
+ *  - never exits prematurely
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
+#include <string.h>
+#include <unistd.h>
 
-static unsigned int parse_seconds(const char *arg, unsigned int fallback)
-{
-    char *end = NULL;
-    unsigned long value = strtoul(arg, &end, 10);
+#define DEFAULT_CHUNK_MB 1
+#define DEFAULT_SLEEP_MS 1000
 
-    if (!arg || *arg == '\0' || (end && *end != '\0') || value == 0)
-        return fallback;
-    return (unsigned int)value;
+static size_t parse_mb(const char *arg, size_t def) {
+    if (!arg) return def;
+    char *end;
+    long val = strtol(arg, &end, 10);
+    if (*end != '\0' || val <= 0) return def;
+    return (size_t)val;
 }
 
-int main(int argc, char *argv[])
-{
-    const unsigned int duration = (argc > 1) ? parse_seconds(argv[1], 10) : 10;
-    const time_t start = time(NULL);
-    time_t last_report = start;
-    volatile unsigned long long accumulator = 0;
+static useconds_t parse_ms(const char *arg, useconds_t def) {
+    if (!arg) return def;
+    char *end;
+    long val = strtol(arg, &end, 10);
+    if (*end != '\0' || val <= 0) return def;
+    return (useconds_t)(val * 1000);
+}
 
-    while ((unsigned int)(time(NULL) - start) < duration) {
-        accumulator = accumulator * 1664525ULL + 1013904223ULL;
+int main(int argc, char *argv[]) {
+    size_t chunk_mb = (argc > 1) ? parse_mb(argv[1], DEFAULT_CHUNK_MB) : DEFAULT_CHUNK_MB;
+    useconds_t sleep_us = (argc > 2) ? parse_ms(argv[2], DEFAULT_SLEEP_MS) : DEFAULT_SLEEP_MS * 1000;
 
-        if (time(NULL) != last_report) {
-            last_report = time(NULL);
-            printf("cpu_hog alive elapsed=%ld accumulator=%llu\n",
-                   (long)(last_report - start),
-                   accumulator);
+    size_t chunk_bytes = chunk_mb * 1024 * 1024;
+    size_t total_mb = 0;
+
+    printf("memory_hog started: chunk=%zuMB sleep=%dus\n", chunk_mb, sleep_us);
+    fflush(stdout);
+
+    while (1) {
+        char *mem = malloc(chunk_bytes);
+        if (!mem) {
+            printf("malloc failed at %zu MB\n", total_mb);
             fflush(stdout);
+            while (1) sleep(1);  // stay alive for observation
         }
+
+        /* Touch every page to ensure RSS increase */
+        for (size_t i = 0; i < chunk_bytes; i += 4096) {
+            mem[i] = 'A';
+        }
+
+        total_mb += chunk_mb;
+
+        printf("allocated: %zu MB total\n", total_mb);
+        fflush(stdout);
+
+        usleep(sleep_us);
     }
 
-    printf("cpu_hog done duration=%u accumulator=%llu\n", duration, accumulator);
     return 0;
 }
