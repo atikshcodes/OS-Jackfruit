@@ -360,15 +360,16 @@ The experiment also illustrates a key CFS property: neither process starves. `cp
 
 ## Scheduler Experiment Results
 
-Both containers ran the same CPU-bound workload (`cpu_hog`, which executes a tight arithmetic loop). They were started simultaneously and stopped after 30 seconds. CPU time was read from `/proc/<pid>/stat` (field 14: `utime`) on the host.
+Two `cpu_hog` processes were launched simultaneously, executing a tight arithmetic loop to create a CPU-bound workload. Their nice values were then adjusted using `renice`: PID 5810 was set to nice **-5** (higher priority), and PID 5809 was set to nice **10** (lower priority). CPU utilization was observed live via `top`.
 
-| Container | Nice Value | CPU Time Consumed (30s run) | % of Total CPU |
-|-----------|------------|----------------------------|----------------|
-| cpu1      | 0          | ~27.4s                     | ~89%           |
-| cpu2      | 10         | ~2.6s                      | ~11%           
-The ratio (~9:1) closely matches the theoretical CFS weight ratio between nice 0 (weight 1024) and nice 10 (weight 110): 1024 / (1024 + 110) ≈ 90%.
+| PID  | Nice Value | %CPU (observed via `top`) |
+|------|------------|--------------------------|
+| 5810 | -5         | 93.7%                    |
+| 5809 | 10         | 3.3%                     |
 
-This confirms that CFS implements weighted fair queuing accurately. The scheduler did not starve `cpu2` — it received CPU time proportional to its weight. In a production setting, this mechanism allows operators to deprioritize background batch jobs (high nice) without completely blocking them, while ensuring latency-sensitive workloads (low nice) get the CPU share they need.
+The observed ratio (~28:1) reflects the large CFS weight difference between nice -5 (weight 335) and nice 10 (weight 110): the higher-priority process dominates CPU time while the lower-priority one is significantly throttled, though not starved entirely.
+
+This confirms that CFS implements weighted fair queuing accurately. In a production setting, this mechanism allows operators to deprioritize background batch jobs (high nice) without completely blocking them, while ensuring latency-sensitive workloads (low nice) get the CPU share they need.
 
 ---
 
