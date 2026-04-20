@@ -392,6 +392,7 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  *   - route each chunk to the correct per-container log file
  *   - exit cleanly when shutdown begins and pending work is drained
  */
+
 void *logging_thread(void *arg)
 {
     supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
@@ -405,15 +406,20 @@ void *logging_thread(void *arg)
 
         fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            ssize_t wr = write(fd, item.data, item.length);
-            (void)wr;
+            write(fd, item.data, item.length);
             close(fd);
         }
+
+        // ✅ ACCUMULATOR OUTPUT (MAIN FIX)
+        printf("[ACCUMULATOR][%s]: %.*s",
+               item.container_id,
+               (int)item.length,
+               item.data);
+        fflush(stdout);
     }
 
     return NULL;
 }
-
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -429,9 +435,12 @@ int child_fn(void *arg)
 {
     child_config_t *cfg = (child_config_t *)arg;
 
-    int sh = sethostname(cfg->id, strlen(cfg->id));
-    (void)sh;
+    // Set hostname (UTS namespace)
+    if (sethostname(cfg->id, strlen(cfg->id)) < 0) {
+        perror("sethostname");
+    }
 
+    // Change root filesystem
     if (chroot(cfg->rootfs) < 0) {
         perror("chroot");
         return 1;
@@ -442,22 +451,32 @@ int child_fn(void *arg)
         return 1;
     }
 
+    // Mount /proc inside container
     mkdir("/proc", 0555);
     if (mount("proc", "/proc", "proc", 0, NULL) < 0) {
         perror("mount proc");
     }
 
-    dup2(cfg->log_write_fd, STDOUT_FILENO);
-    dup2(cfg->log_write_fd, STDERR_FILENO);
-    close(cfg->log_write_fd);
-
-    if (cfg->nice_value != 0) {
-        int nv = nice(cfg->nice_value);
-        (void)nv;
+    // Redirect stdout and stderr to pipe
+    if (dup2(cfg->log_write_fd, STDOUT_FILENO) < 0 ||
+        dup2(cfg->log_write_fd, STDERR_FILENO) < 0) {
+        perror("dup2");
+        return 1;
     }
 
-    execlp(cfg->command, cfg->command, (char *)NULL);
+    close(cfg->log_write_fd);
 
+    // Set nice value if provided
+    if (cfg->nice_value != 0) {
+        if (nice(cfg->nice_value) < 0) {
+            perror("nice");
+        }
+    }
+
+    // Execute command (IMPORTANT: use execl, not execlp)
+    execl(cfg->command, cfg->command, (char *)NULL);
+
+    // If exec fails
     perror("exec");
     return 1;
 }
@@ -572,6 +591,10 @@ static int run_supervisor(const char *rootfs)
     (void)rootfs;
 
     memset(&ctx, 0, sizeof(ctx));
+
+    // ✅ Disable stdout buffering for real-time accumulator output
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
 
@@ -618,6 +641,7 @@ static int run_supervisor(const char *rootfs)
     while (1) {
 
         reap_children(&ctx);
+
         control_request_t req;
         control_response_t resp;
 
@@ -633,6 +657,7 @@ static int run_supervisor(const char *rootfs)
             continue;
         }
 
+        // -------------------- PS --------------------
         if (req.kind == CMD_PS) {
             container_record_t *cur = ctx.containers;
             char out[CONTROL_MESSAGE_LEN] = "";
@@ -654,114 +679,123 @@ static int run_supervisor(const char *rootfs)
             resp.status = 0;
             strncpy(resp.message, out, sizeof(resp.message) - 1);
         }
+
+        // -------------------- START / RUN --------------------
         else if (req.kind == CMD_START || req.kind == CMD_RUN) {
-        int pipefd[2];
-        void *stack;
-        pid_t pid;
-        child_config_t *cfg;
-        pthread_t tid;
+            int pipefd[2];
+            void *stack;
+            pid_t pid;
+            child_config_t *cfg;
+            pthread_t tid;
 
-        if (find_container(&ctx, req.container_id)) {
-            resp.status = 1;
-            strcpy(resp.message, "Container ID already exists");
-        } else if (pipe(pipefd) < 0) {
-            resp.status = 1;
-            strcpy(resp.message, "pipe failed");
-        } else {
-            cfg = calloc(1, sizeof(*cfg));
-            stack = malloc(STACK_SIZE);
-
-            strncpy(cfg->id, req.container_id, sizeof(cfg->id) - 1);
-            strncpy(cfg->rootfs, req.rootfs, sizeof(cfg->rootfs) - 1);
-            strncpy(cfg->command, req.command, sizeof(cfg->command) - 1);
-            cfg->nice_value = req.nice_value;
-            cfg->log_write_fd = pipefd[1];
-
-            pid = clone(child_fn,
-                        (char *)stack + STACK_SIZE,
-                        CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD,
-                        cfg);
-
-            if (pid < 0) {
+            if (find_container(&ctx, req.container_id)) {
                 resp.status = 1;
-                strcpy(resp.message, "clone failed");
-            } else {
-                struct {
-                    supervisor_ctx_t *ctx;
-                    int fd;
-                    char id[CONTAINER_ID_LEN];
-                } *info;
+                strcpy(resp.message, "Container ID already exists");
+            }
+            else if (pipe(pipefd) < 0) {
+                resp.status = 1;
+                strcpy(resp.message, "pipe failed");
+            }
+            else {
+                cfg = calloc(1, sizeof(*cfg));
+                stack = malloc(STACK_SIZE);
 
-                close(pipefd[1]);
+                strncpy(cfg->id, req.container_id, sizeof(cfg->id) - 1);
+                strncpy(cfg->rootfs, req.rootfs, sizeof(cfg->rootfs) - 1);
+                strncpy(cfg->command, req.command, sizeof(cfg->command) - 1);
+                cfg->nice_value = req.nice_value;
+                cfg->log_write_fd = pipefd[1];
 
-                info = malloc(sizeof(*info));
-                info->ctx = &ctx;
-                info->fd = pipefd[0];
-                strncpy(info->id, req.container_id, sizeof(info->id) - 1);
+                pid = clone(child_fn,
+                            (char *)stack + STACK_SIZE,
+                            CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | SIGCHLD,
+                            cfg);
 
-                pthread_create(&tid, NULL, pipe_reader_thread, info);
-                pthread_detach(tid);
+                if (pid < 0) {
+                    resp.status = 1;
+                    strcpy(resp.message, "clone failed");
+                } else {
+                    struct {
+                        supervisor_ctx_t *ctx;
+                        int fd;
+                        char id[CONTAINER_ID_LEN];
+                    } *info;
 
-                add_container(&ctx,
-                            req.container_id,
-                            pid,
-                            req.soft_limit_bytes,
-                            req.hard_limit_bytes);
+                    close(pipefd[1]);
 
-                register_with_monitor(ctx.monitor_fd,
-                                    req.container_id,
-                                    pid,
-                                    req.soft_limit_bytes,
-                                    req.hard_limit_bytes);
+                    info = malloc(sizeof(*info));
+                    info->ctx = &ctx;
+                    info->fd = pipefd[0];
+                    strncpy(info->id, req.container_id, sizeof(info->id) - 1);
 
-                resp.status = 0;
-                strcpy(resp.message, "Container started");
+                    pthread_create(&tid, NULL, pipe_reader_thread, info);
+                    pthread_detach(tid);
+
+                    add_container(&ctx,
+                                  req.container_id,
+                                  pid,
+                                  req.soft_limit_bytes,
+                                  req.hard_limit_bytes);
+
+                    register_with_monitor(ctx.monitor_fd,
+                                          req.container_id,
+                                          pid,
+                                          req.soft_limit_bytes,
+                                          req.hard_limit_bytes);
+
+                    resp.status = 0;
+                    strcpy(resp.message, "Container started");
+                }
             }
         }
-    }
-    else if (req.kind == CMD_LOGS) {
-        char path[PATH_MAX];
-        FILE *fp;
-        size_t n;
 
-        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.container_id);
+        // -------------------- LOGS --------------------
+        else if (req.kind == CMD_LOGS) {
+            char path[PATH_MAX];
+            FILE *fp;
+            size_t n;
 
-        fp = fopen(path, "r");
-        if (!fp) {
-            resp.status = 1;
-            strcpy(resp.message, "No log file");
-        } else {
-            n = fread(resp.message, 1, sizeof(resp.message) - 1, fp);
-            resp.message[n] = '\0';
-            resp.status = 0;
-            fclose(fp);
+            snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.container_id);
+
+            fp = fopen(path, "r");
+            if (!fp) {
+                resp.status = 1;
+                strcpy(resp.message, "No log file");
+            } else {
+                n = fread(resp.message, 1, sizeof(resp.message) - 1, fp);
+                resp.message[n] = '\0';
+                resp.status = 0;
+                fclose(fp);
+            }
         }
-    }
-    else if (req.kind == CMD_STOP) {
-        container_record_t *c = find_container(&ctx, req.container_id);
 
-        if (!c) {
-            resp.status = 1;
-            strcpy(resp.message, "Container not found");
-        } else {
-            kill(c->host_pid, SIGTERM);
-            c->state = CONTAINER_STOPPED;
-            resp.status = 0;
-            strcpy(resp.message, "Container stopped");
+        // -------------------- STOP --------------------
+        else if (req.kind == CMD_STOP) {
+            container_record_t *c = find_container(&ctx, req.container_id);
+
+            if (!c) {
+                resp.status = 1;
+                strcpy(resp.message, "Container not found");
+            } else {
+                kill(c->host_pid, SIGTERM);
+                c->state = CONTAINER_STOPPED;
+                resp.status = 0;
+                strcpy(resp.message, "Container stopped");
+            }
         }
-    }
-    else {
-        resp.status = 0;
-        strcpy(resp.message, "Unknown command");
-    }
 
-        ssize_t wr2 = write(client_fd, &resp, sizeof(resp));
-        (void)wr2;
+        else {
+            resp.status = 0;
+            strcpy(resp.message, "Unknown command");
+        }
+
+        write(client_fd, &resp, sizeof(resp));
         close(client_fd);
     }
 
     return 0;
 }
+ 
 
 /*
  * TODO:
